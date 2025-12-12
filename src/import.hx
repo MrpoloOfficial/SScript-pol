@@ -1,4 +1,4 @@
-#if (!macro && !DISABLED_MACRO_SUPERLATIVE)
-import teaBase.*;
-import teaBase.Expr;
+#if !macro
+import hscriptBase.*;
+import hscriptBase.Expr;
 #end

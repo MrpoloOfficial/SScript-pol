@@ -1,13 +1,13 @@
 {
   "name": "SScript",
-  "url": "",
-  "license": "MIT",
-  "tags": [],
-  "description": "SScript is discontinued! Thank you for your support!",
-  "version": "21.0.0",
+  "url": "https://github.com/TahirKarabekiroglu/SScript",
+  "license": "Apache",
+  "tags": ["hscript", "sscript"],
+  "description": "An easy-to-use Haxe Script tool for all targets.",
+  "version": "7.7.0",
   "classPath": "src/",
-  "releasenote": "SScript is discontinued! Thank you for your support!",
-  "contributors": ["TahirKarabekiroglu"],
+  "releasenote": "SScript setup mode",
+  "contributors": ["tahirk786"],
   "dependencies": {
   }
 }

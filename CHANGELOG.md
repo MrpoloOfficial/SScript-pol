@@ -1,1 +1,0 @@
-# SScript is discontinued! Thank you for your support!

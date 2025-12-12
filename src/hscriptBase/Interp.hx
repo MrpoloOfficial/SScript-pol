@@ -19,11 +19,11 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-package teaBase;
+package hscriptBase;
 
 import haxe.ds.*;
 import haxe.PosInfos;
-import teaBase.Expr;
+import hscriptBase.Expr;
 import haxe.Constraints;
 import tea.SScript;
 
@@ -35,27 +35,13 @@ private enum Stop {
 	SReturn;
 }
 
-private enum SScriptNull {
-	Not_NULL;
-}
-
 @:keepSub
-@:access(teaBase.TeaClass)
-@:access(teaBase.Parser)
 @:access(tea.SScript)
 class Interp {
 
-	static var eabstracts:Array<String> = [];
-	static var EABSTRACTS:Map<String, { ?fileName : String , tea : TeaEAbstract }> = [];
-	static var classes:Array<String> = [];
-	static var STATICPACKAGES:Map<String, { ?fileName : String , tea : TeaClass }> = [];
-	var pushedVars:Array<String> = [];
-	var pushedClasses:Array<String> = [];
-	var pushedAbs:Array<String> = [];
-
 	#if haxe3
 	public var variables : Map<String,Dynamic>;
-	var finalVariables : Map<String,Dynamic>;
+	public var dynamicFuncs: Map<String, Bool> = new Map();
 	var locals : Map<String,{ r : Dynamic , ?isFinal : Bool , ?t:CType , ?dynamicFunc : Bool }>;
 	var binops : Map<String, Expr -> Expr -> Dynamic >;
 	#else
@@ -71,7 +57,7 @@ class Interp {
 
 	var typecheck : Bool = true;
 
-	var privateAccess : Bool = false;
+	var usingStringTools : Bool = false;
 
 	var script : SScript;
 
@@ -79,32 +65,12 @@ class Interp {
 
 	var specialObject : {obj:Dynamic , ?includeFunctions:Bool , ?exclusions:Array<String>} = {obj : null , includeFunctions: null , exclusions: null };
 
-	var inPublic : Bool = false;
-	var inPrivate : Bool = false;
-	var inClass : Bool = false;
-
-	var inStatic : Bool = false;
-
-	var hasPrivateAccess : Bool = false;
-	var noPrivateAccess : Bool = false;
-
-	var strictVar : Bool = false;
-	var inBool : Bool = false;
-
-	var inCall : Bool = false;
-	var currentArg : String;
-
-	var improvedField : Bool = true;
-
-	var curClass : String;
-
 	public inline function setScr(s)
 	{
 		return script = s;
 	}
 
-	var resumeError : Bool = false;
-	var canUseAbs : Bool = false;
+	var resumeError:Bool;
 
 	public function new() {
 		#if haxe3
@@ -120,39 +86,34 @@ class Interp {
 	private function resetVariables(){
 		#if haxe3
 		variables = new Map<String,Dynamic>();
-		finalVariables = new Map();
 		#else
 		variables = new Hash();
 		#end
 
-		finalVariables.set("null",null);
-		finalVariables.set("true",true);
-		finalVariables.set("false",false);
-		finalVariables.set("trace", Reflect.makeVarArgs(function(el) {
+		variables.set("null",null);
+		variables.set("true",true);
+		variables.set("false",false);
+		variables.set("trace", Reflect.makeVarArgs(function(el) {
 			var inf = posInfos();
 			var v = el.shift();
 			if( el.length > 0 ) inf.customParams = el;
 			haxe.Log.trace(Std.string(v), inf);
 		}));
-		finalVariables.set("Bool", Bool);
-		finalVariables.set("Int", Int);
-		finalVariables.set("Float", Float);
-		finalVariables.set("String", String);
-		finalVariables.set("Dynamic", Dynamic);
-		finalVariables.set("Array", Array);
+		variables.set("Bool", Bool);
+		variables.set("Int", Int);
+		variables.set("Float", Float);
+		variables.set("String", String);
+		variables.set("Dynamic", Dynamic);
+		variables.set("Array", Array);
 	}
 
 	public function posInfos(): PosInfos {
-		if(curExpr != null)
+		if (curExpr != null)
 			return cast { fileName : curExpr.origin, lineNumber : curExpr.line };
 		return cast { fileName : "SScript", lineNumber : 0 };
 	}
 
 	var inFunc : Bool = false;
-	var abortFunc : Bool = false;
-	var returnedNothing : Bool = true;
-
-	var newFunc = { func : null , arguments : null };
 
 	function initOps() {
 		var me = this;
@@ -213,9 +174,9 @@ class Interp {
 
 		switch Tools.expr(e2)
 		{
-			case EIdent("Class"):
+			case EIdent("Class",_):
 				return Std.isOfType(expr1, Class);
-			case EIdent("Map"):
+			case EIdent("Map",_):
 				return Std.isOfType(expr1, IMap);
 			case _:
 		}
@@ -236,7 +197,7 @@ class Interp {
 		var expr1=e1;
 		var expr2=e2;
 		var e1=me.expr(e1);
-		return if(e1==null) assign(expr1,expr2) else e1;
+		return if (e1==null) assign(expr1,expr2) else e1;
 	}
 
 	function setVar( name : String, v : Dynamic ) {
@@ -253,17 +214,16 @@ class Interp {
 	function assign( e1 : Expr, e2 : Expr ) : Dynamic {
 		var v = expr(e2);
 		switch( Tools.expr(e1) ) {
-		case EIdent(id):
-			if( locals.get(id)!=null&&locals.get(id).isFinal )
+		case EIdent(id,f):
+			if(locals.get(id)!=null&&locals.get(id).isFinal)
 				return error(EInvalidFinal(id));
 			var l = locals.get(id);
 			if( l == null )
 			{
-				if( finalVariables.exists(id) )
-					return error(EInvalidFinal(id));
-		
 				if(!variables.exists(id))
 					error(EUnknownVariable(id));
+				if(Type.typeof(variables.get(id))==TFunction&&!dynamicFuncs.exists(id))
+					error(EFunctionAssign(id));
 				setVar(id,v);
 			}
 			else {
@@ -282,18 +242,12 @@ class Interp {
 					error(EFunctionAssign(id));
 				l.r = v;
 			}
-		case EField(e,f,fields):
-			if( improvedField && fields != null && fields.length > 1 )
-			{
-				var r = findField(fields,'set',f,v);
-				if( r != null )
-					return r;
-			}
+		case EField(e,f):
 			v = set(expr(e),f,v);
 		case EArray(e, index):
 			var arr:Dynamic = expr(e);
 			var index:Dynamic = expr(index);
-			if(isMap(arr)) {
+			if (isMap(arr)) {
 				setMapValue(arr, index, v);
 			}
 			else {
@@ -321,17 +275,14 @@ class Interp {
 				setVar(id,v)
 			else
 				l.r = v;
-		case EField(e,f,fields):
-			var r = null;	
-			if( improvedField && fields != null && fields.length > 1 )
-				r = findField(fields,"op");
-			var obj = r != null ? r : expr(e);
+		case EField(e,f):
+			var obj = expr(e);
 			v = fop(get(obj,f),expr(e2));
 			v = set(obj,f,v);
 		case EArray(e, index):
 			var arr:Dynamic = expr(e);
 			var index:Dynamic = expr(index);
-			if(isMap(arr)) {
+			if (isMap(arr)) {
 				v = fop(getMapValue(arr, index), expr(e2));
 				setMapValue(arr, index, v);
 			}
@@ -347,25 +298,19 @@ class Interp {
 
 	function increment( e : Expr, prefix : Bool, delta : Int ) : Dynamic {
 		curExpr = e;
-		var oldExpr = e;
 		var e = e.e;
 		switch(e) {
 		case EIdent(id):
 			var l = locals.get(id);
-			var v : Null<Dynamic> = (l == null) ? resolve(id) : l.r;
-			if( v != null && !Std.isOfType(v,Float) )
-				error(ECustom(Tools.checkType(v,Int)));
+			var v : Dynamic = (l == null) ? resolve(id) : l.r;
 			if( prefix ) {
 				v += delta;
 				if( l == null ) setVar(id,v) else l.r = v;
 			} else
 				if( l == null ) setVar(id,v + delta) else l.r = v + delta;
 			return v;
-		case EField(e,f,fields):
-			var r = null;	
-			if( improvedField && fields != null && fields.length > 1 )
-				r = findField(fields,"op");
-			var obj = r != null ? r : expr(e);
+		case EField(e,f):
+			var obj = expr(e);
 			var v : Dynamic = get(obj,f);
 			if( prefix ) {
 				v += delta;
@@ -376,9 +321,9 @@ class Interp {
 		case EArray(e, index):
 			var arr:Dynamic = expr(e);
 			var index:Dynamic = expr(index);
-			if(isMap(arr)) {
+			if (isMap(arr)) {
 				var v = getMapValue(arr, index);
-				if(prefix) {
+				if (prefix) {
 					v += delta;
 					setMapValue(arr, index, v);
 				}
@@ -396,14 +341,6 @@ class Interp {
 					arr[index] = v + delta;
 				return v;
 			}
-		case EConst(c): 
-			switch c {
-				case CFloat(_) | CInt(_):
-					return error(EInvalidAssign);
-				case _:
-					var e:Null<Dynamic> = expr(oldExpr);
-					return error(ECustom(Tools.checkType(e, Int)));
-			}
 		default:
 			return error(EInvalidOp((delta > 0)?"++":"--"));
 		}
@@ -417,6 +354,7 @@ class Interp {
 		locals = new Hash();
 		#end
 		declared = new Array();
+		var r = exprReturn(expr);
 		switch Tools.expr(expr){
 			case EBlock(e):
 				var imports:Int = 0;
@@ -426,13 +364,13 @@ class Interp {
 					{
 						case EPackage(_):
 							if(e.indexOf(i)>0)
-								error(EUnexpected("package"));
+								error(ECustom('Unexpected package'));
 							else if(pack > 1)
 								error(ECustom('Multiple packages has been declared'));
 							pack++;
-						case EImport(_,_,_) | EImportStar(_) | EUsing(_):
+						case EImport(_,_,_):
 							if(e.indexOf(i)>imports + pack)
-								error(EUnexpected("import"));
+								error(ECustom('Unexpected import'));
 							imports++;
 						case _:
 					}
@@ -441,7 +379,6 @@ class Interp {
 					error(ECustom('Multiple packages has been declared'));
 			case _:
 		}
-		var r = this.expr(expr);
 		return r;
 	}
 
@@ -453,7 +390,6 @@ class Interp {
 			case SBreak: throw "Invalid break";
 			case SContinue: throw "Invalid continue";
 			case SReturn:
-				returnedNothing = false;
 				var v = returnValue;
 				returnValue = null;
 				return v;
@@ -462,7 +398,6 @@ class Interp {
 		return null;
 	}
 
-	var shouldAbort = false;
 	function duplicate<T>( h : #if haxe3 Map < String, T > #else Hash<T> #end ) {
 		#if haxe3
 		var h2 = new Map();
@@ -482,16 +417,7 @@ class Interp {
 	}
 
 	inline function error(e : ErrorDef , rethrow=false ) : Dynamic {
-		if(resumeError)return null;
-		if( curExpr == null )
-			curExpr = { origin: {
-				if(script.customOrigin != null && script.customOrigin.length > 0)
-					script.customOrigin;
-				else if(script.scriptFile != null && script.scriptFile.length > 0)
-					script.scriptFile;
-				else 
-					"SScript";
-			} , pmin : 0 , pmax : 0 , line : 0 , e : null };
+		if (resumeError)return null;
 		var e = new Error(e, curExpr.pmin, curExpr.pmax, curExpr.origin, curExpr.line);
 		if( rethrow ) this.rethrow(e) else throw e;
 		return null;
@@ -505,29 +431,17 @@ class Interp {
 		#end
 	}
 
-	function resolve( id : String ) : Dynamic { 
+	function resolve( id : String ) : Dynamic {
 		var l = locals.get(id);
 		if( l != null )
 			return l.r;
-		if( STATICPACKAGES.exists(id) )
-			return STATICPACKAGES[id].tea;
-		else if( EABSTRACTS.exists(id) )
-			return canUseAbs ? EABSTRACTS[id].tea : error(ECannotUseAbs);
+		var v = variables.get(id);
 		if( specialObject != null && specialObject.obj != null )
 		{
 			var field = Reflect.getProperty(specialObject.obj,id);
 			if( field != null && (specialObject.includeFunctions || Type.typeof(field) != TFunction) && (specialObject.exclusions == null || !specialObject.exclusions.contains(id)) )
 				return field;
 		}
-		if( finalVariables.exists("this") ) {
-			var v = finalVariables["this"];
-			if( Reflect.hasField(v,id) )
-				return Reflect.getProperty(v,id);
-		}
-		var v = finalVariables.get(id);
-		if( finalVariables.exists(id) )
-			return v;
-		var v = variables.get(id);
 		if( v==null && !variables.exists(id) )
 			error(EUnknownVariable(id));
 		return v;
@@ -535,162 +449,8 @@ class Interp {
 
 	public function expr( e : Expr ) : Dynamic {
 		curExpr = e;
-		var og = e;
 		var e = e.e;
 		switch( e ) {
-		case EEAbstract(ident,parent,exprs,fromParent):
-			if( eabstracts.contains(ident) || classes.contains(ident) )
-			{
-				var tea = null;
-				if( EABSTRACTS[ident] != null )
-					tea = EABSTRACTS[ident].fileName;
-				else if( STATICPACKAGES[ident] != null )
-					tea = STATICPACKAGES[ident].fileName;
-				error(EAlreadyModule(ident,tea));
-			}
-			else if( ident == ident.toLowerCase() )
-				error(ETypeName);
-
-			var abstractValueInt = -1;
-			eabstracts.push(ident);
-			pushedAbs.push(ident);
-			var eabstract = new TeaEAbstract(ident);
-			for( i in exprs ) {
-				var isPublic = true;
-				var evar = null;
-				switch i.e {
-					case EVar(_,_,_,_): evar = i.e;
-					case EPublic(e): switch e.e {
-						case EVar(_,_,_,_): evar = e.e;
-						case _:
-					}
-					case EPrivate(e): switch e.e {
-						case EVar(_,_,_,_): 
-							isPublic = false;
-							evar = e.e;
-						case _:
-					} 
-					case _:
-				}
-
-				if( evar != null ) {
-					var name:String = null,value:Null<Dynamic> = null,type:String = null;
-					var reallyNull = false;
-					switch evar {
-						case EVar(n,_,t,e):
-							if( e == null ) reallyNull = true;
-							name = n;
-							value = e != null ? expr(e) : null;
-							type = t != null ? Tools.ctToType(t) : null;
-						case _:
-					}
-					var sugar = TeaEAbstract.createSugar(isPublic,name,value);
-					if( eabstract.fields.exists(name) )
-						error(ECustom("Duplicate abstract field declaration : " + ident + "." + name));
-					if( parent == "Int" ) {
-						if( value == null && reallyNull ) 
-						{
-							sugar.v = abstractValueInt + 1;
-							abstractValueInt++;
-						}
-						else if( value != null && abstractValueInt != value && !reallyNull ) abstractValueInt = sugar.v;
-						else if( !(value != null && abstractValueInt == value) ) abstractValueInt++;
-					}
-					else if( parent == "String" && value == null && reallyNull ) {
-						sugar.v = name;
-					}
-
-					eabstract.fields[name] = sugar;
-				}
-			}
-			var fileName = null;
-			if( script.customOrigin != null && script.customOrigin.length > 0 )
-				fileName = script.customOrigin;
-			else if( script.scriptFile != null && script.scriptFile.length > 0 )
-				fileName = script.scriptFile;
-			EABSTRACTS[ident] = { fileName : fileName , tea : eabstract }
-			return if( strictVar ) error(EUnexpected("enum")) else null;
-		case EClass(cl,e):
-			if( classes.contains(cl) || eabstracts.contains(cl) )
-			{
-				var tea = null;
-				if( EABSTRACTS[cl] != null )
-					tea = EABSTRACTS[cl].fileName;
-				else if( STATICPACKAGES[cl] != null )
-					tea = STATICPACKAGES[cl].fileName;
-				error(EMultipleDecl(cl,tea));
-			}
-			else if( cl == cl.toLowerCase() )
-				error(ETypeName);
-
-			inClass = true;
-			for( e in e ) {
-				var expr = e.e;
-				switch expr {
-					case EPublic(e):
-						switch e.e {
-							case EStatic(_,_):
-							case _: 
-						}
-					case EPrivate(e):
-						switch e.e {
-							case EStatic(_,_):
-							case _: 
-						}
-					case EStatic(_,_):
-					case _: 
-				}
-			}
-
-			classes.push(cl);
-			pushedClasses.push(cl);
-			script.setClassPath(cl);
-			curClass = cl;
-			var v = null;
-			if( !STATICPACKAGES.exists(cl) )
-			{
-				var fileName = null;
-				if( script.customOrigin != null && script.customOrigin.length > 0 )
-					fileName = script.customOrigin;
-				else if( script.scriptFile != null && script.scriptFile.length > 0 )
-					fileName = script.scriptFile;
-
-				v = new TeaClass(cl);
-				STATICPACKAGES.set(cl,{ fileName : fileName , tea : v });
-			}
-			for( e in e ) switch e.e {
-				case _: expr(e);
-			}
-			inClass = false;
-			return if( strictVar ) error(EUnexpected("class")) else null;
-		case EPublic(e):
-			if( inPublic && !inStatic )
-				error(EUnexpected("public"));
-			
-			inPrivate = false;
-			inPublic = true;
-			expr(e);
-			inPublic = false;
-			return if( strictVar ) error(EUnexpected("public")); else null;
-		case EPrivate(e):
-			if( inPrivate && !inStatic )
-				error(EUnexpected("private"));
-
-			inPublic = false;
-			inPrivate = true;
-			expr(e);
-			inPrivate = false;
-			return if( strictVar ) error(EUnexpected("private")) else null;
-		case EStatic(e,inPublic):
-			inStatic = true;
-			if( inPublic != null )
-			{
-				this.inPublic = inPublic;
-				inPrivate = !inPublic;
-			}
-			expr(e);
-			inStatic = false;
-			return if( strictVar ) error(EUnexpected("static")) else null;
 		case EConst(c):
 			switch( c ) {
 			case CInt(v): return v;
@@ -700,35 +460,9 @@ class Interp {
 			case CInt32(v): return v;
 			#end
 			}
-		case EInterpString(string, interpolatedString):
-			var s = string.copy();
-			for( i in interpolatedString ) {
-				var str = s[i.index];
-				if( str != null ) {
-					script.parser.inInterp = true;
-					var expr = Std.string(expr(script.parser.parseString(i.str)));
-					script.parser.inInterp = false;
-					str = str.replace(i.str, expr);
-					s[i.index] = str;
-				}
-			}
-			return s.join('');	
-		case EEReg(chars, ops):
-			#if !(cpp || neko) // not supported on other targets
-			ops = ops.split('u').join('');
-			#end
-
-			#if (cs || js) // not supported on C# and JavaScript
-			ops = ops.split('s').join('');
-			#end
-
-			return new EReg(chars,ops);
 		case EIdent(id):
-			strictVar = true;
-			var e = resolve(id);
-			strictVar = false;
-			return e;
-		case EVar(n,f,t,e):
+			return resolve(id);
+		case EVar(n,t,e,g):
 			if(t!=null&&e!=null)
 			{
 				var e = expr(e);
@@ -741,9 +475,7 @@ class Interp {
 				if(!Tools.compatibleWithEachOther(ftype, stype)&&ftype!=stype&&ftype!='Anon'&&!Tools.compatibleWithEachOtherObjects(cl,clN)){error(EUnmatchingType(ftype, stype, n));}
 			}
 
-			strictVar = true;
 			var expr1 : Dynamic = e == null ? null : expr(e);
-			strictVar = false;
 			var name = null;
 			var isMap = t != null && e != null && (switch t {
 				case CTPath(path,_):
@@ -769,61 +501,37 @@ class Interp {
 					case _: 
 				};
 
-			var variables = f ? finalVariables : variables;
-			if( !inStatic )
+			declared.push({ n : n, old : locals.get(n) });
+			locals.set(n,{ r : expr1 , isFinal : false, t: t});
+			return null;
+		case EFinal(n,t,e):
+			if(t!=null&&e!=null)
 			{
-				if( !inPublic && !inPublic )
-				{
-					declared.push({ n : n, old : locals.get(n) });
-					locals.set(n,{ r : expr1 , isFinal : f, t: t});
-				}
-				else 
-					variables.set(n,expr1);
+				var e = expr(e);
+				var ftype:String = Tools.ctToType(t);
+				var stype:String = Tools.getType(e);
+				var cl=variables.get(ftype);
+				var clN=Tools.getType(e,true);
+
+				if(typecheck)
+				if(!Tools.compatibleWithEachOther(ftype, stype)&&ftype!=stype&&ftype!='Anon'&&!Tools.compatibleWithEachOtherObjects(cl,clN))error(EUnmatchingType(ftype, stype, n));
 			}
-			else
-			{
-				variables.set(n,expr1);
-				if( script.classPath != null && script.classPath.length > 0 && STATICPACKAGES.exists(script.classPath) )
-					STATICPACKAGES.get(script.classPath).tea.fields.set(n,TeaClass.createSugar(inPublic && !noPrivateAccess, expr1, f, noPrivateAccess, false));
-				else if( inPublic ) 
-				{
-					if( !pushedVars.contains(n) ) {
-						pushedVars.push(n);
-						SScript.globalVariables.set(n,expr1);
-					}
-				}
-			}
-			return if( strictVar ) error(EUnexpected(f ? "final" : "var")) else null;
+
+			declared.push({ n : n, old : locals.get(n) });
+			locals.set(n,{ r : (e == null)?null:expr(e) , isFinal : true});
+			return null;
 		case EParent(e):
 			return expr(e);
 		case EBlock(exprs):
 			var old = declared.length;
 			var v = null;
 			for( e in exprs ) {
-				if( !shouldAbort )
-				{
-					v = expr(e);
-				}
-				else 
-				{
-					shouldAbort = false;
-					restore(old);
-					break;
-				}
+				v = expr(e);
 			}
 			restore(old);
 			return v;
-		case EField(e,f,fields):
-			canUseAbs = true;
-			if( improvedField && fields != null && fields.length > 1 )
-			{
-				var r = findField(fields);
-				if( r != null )
-					return r;
-			}
-			var r = get(expr(e),f);
-			canUseAbs = false;
-			return r;
+		case EField(e,f):
+			return get(expr(e),f);
 		case ESwitchBinop(p, e1, e2):
 			var parent = expr(p);
 			var e1 = expr(e1), e2 = expr(e2);
@@ -839,115 +547,76 @@ class Interp {
 		case EUnop(op,prefix,e):
 			switch(op) {
 			case "!":
-				var e:Null<Dynamic> = expr(e);
-				if( e != null && !Std.isOfType(Bool,e) )
-					error(ECustom(Tools.checkType(e,Bool)));
-				return !e;
+				return expr(e) != true;
 			case "-":
-				var e:Null<Dynamic> = expr(e);
-				if( e != null && !Std.isOfType(Int,e) )
-					error(ECustom(Tools.checkType(e,Int)));
-				return -e;
+				return -expr(e);
 			case "++":
 				return increment(e,prefix,1);
 			case "--":
 				return increment(e,prefix,-1);
 			case "~":
-				var e:Null<Dynamic> = expr(e);
-				if( e != null && !Std.isOfType(Int,e) )
-					error(ECustom(Tools.checkType(e,Int)));
-				#if(neko && !haxe3)
-				return haxe.Int32.complement(e);
+				#if (neko && !haxe3)
+				return haxe.Int32.complement(expr(e));
 				#else
-				return ~e;
+				return ~expr(e);
 				#end
 			default:
 				error(EInvalidOp(op));
 			}
 		case ECall(e,params):
+			var id = switch( e.e ){
+				case EIdent(v,i):
+					v;
+				default: null;
+			}
+
 			var args = new Array();
 			for( p in params )
-			{
 				args.push(expr(p));
-			}
-			
-			switch( Tools.expr(e) ) {
-			case EField(e,f,fields):
-				strictVar = true;
-				var r = null;
-				if( improvedField && fields != null && fields.length > 1 )
-					r = findField(fields,"op");
 
-				var obj = r != null ? r : expr(e);
-				strictVar = false;
+			switch( Tools.expr(e) ) {
+			case EField(e,f):
+				var obj = expr(e);
 				if( obj == null ) error(EInvalidAccess(f));
 				return fcall(obj,f,args);
 			default:
-				strictVar = true;
-				var e = expr(e);
-				strictVar = false;
-				return call(null,e,args);
+				return call(null,expr(e),args);
 			}
 		case EIf(econd,e1,e2):
-			strictVar = true;
-			inBool = true;
-			var econd = expr(econd);
-			checkBool(econd, "if");
-			inBool = false;
-			strictVar = false;
-			return if( econd ) expr(e1) else if( e2 == null ) null else expr(e2);
+			return if( expr(econd) == true ) expr(e1) else if( e2 == null ) null else expr(e2);
 		case EWhile(econd,e):
-			if( strictVar ) return error(EUnexpected("while"));
 			whileLoop(econd,e);
 			return null;
 		case EDoWhile(econd,e):
-			if( strictVar ) return error(EUnexpected("do"));
 			doWhileLoop(econd,e);
 			return null;
-		case EFor(v,v2,it,e):
-			forLoop(v,v2,it,e);
+		case EFor(v,it,e):
+			forLoop(v,it,e);
 			return null;
 		case EBreak:
 			throw SBreak;
 		case EContinue:
 			throw SContinue;
-		case EReturnEmpty:
-			if(inFunc) {
-				shouldAbort = true;
-				return null;
-			} else 
-			return error(EUnexpected("return"));
 		case EReturn(e):
 			returnValue = e == null ? null : expr(e);
 			throw SReturn;
 		case EImportStar(pkg):
 			pkg = pkg.trim();
 			var c = Type.resolveClass(pkg);
-			var en = Type.resolveEnum(pkg);
 			if( c != null )
 			{
 				var fields = Reflect.fields(c);
 				for( field in fields )
 				{
 					var f = Reflect.getProperty(c,field);
-					if( f != null )
-						finalVariables.set(field,f);
-				}
-			}
-			else if( en != null ) 
-			{
-				var f = Reflect.fields(en);
-				for( field in f )
-				{
-					var f = Reflect.field(en, field);
-					if( f != null ) 
-						finalVariables.set(field,f);
+					if(f != null)
+						variables.set(field,f);
 				}
 			}
 			else 
 			{
-				#if(!macro && !DISABLED_MACRO_SUPERLATIVE)
-				var map = @:privateAccess Tools.allClassesAvailable;
+				#if !macro
+				var map = macro.Macro.allClassesAvailable;
 				var cl = new Map<String, Class<Dynamic>>();
 				for( i => k in map )
 				{
@@ -962,7 +631,7 @@ class Interp {
 					var hasSamePkg = true;
 					for( i in 0...length.length )
 					{
-						if(length[i] != length2[i])
+						if (length[i] != length2[i])
 						{
 							hasSamePkg = false;
 							break;
@@ -973,106 +642,70 @@ class Interp {
 				}
 
 				for( i => k in cl )
-					finalVariables[i] = k;
+					variables[i] = k;
 				#end
 			}
 
-			return if( strictVar ) error(EUnexpected("import")) else null;
-		case EImport( e , c , asIdent , f ):
-			var og = c;
-			if( asIdent != null )
-				c = asIdent;
+			return null;
+		case EImport( e, c , _ ):
 			if( c != null && e != null )
-				finalVariables.set(c,e);
-			if( e == null && STATICPACKAGES.exists(og) )
-			{
-				f = null;
-				for( i => k in STATICPACKAGES[og].tea.fields )
-					variables.set(i, k.v);
-			}
-			if( e == null && f != null )
-				error(ETypeNotFound(f));
-				
-			return if( strictVar ) error(EUnexpected("import")) else null;
-		case EUsing( e, c ):
-			if( c != null && e != null )
-				finalVariables.set( c , e );
+				variables.set( c , e );
 
-			return if( strictVar ) error(EUnexpected("using")) else null;
+			return null;
+		case EUsing( e, c ):
+			var stringTools = c == 'StringTools' && e == StringTools;
+
+			if( c != null && e != null && !stringTools )
+				variables.set( c , e );
+			if( stringTools )
+				usingStringTools = true;
+
+			return null;
 		case EPackage(p):
 			if( p == null )
-				error(EUnexpected("package"));
+				error(EUnexpected(p));
 
+			if( p!=p.toLowerCase() )
+				error(ECustom('Package path cannot have capital letters'));
 			@:privateAccess script.setPackagePath(p);
-			return if( strictVar ) error(EUnexpected("package")) else null;
-		case EFunction(params,fexpr,name,_,line):
+			return null;
+		case EFunction(params,fexpr,name,_,d):
 			var capturedLocals = duplicate(locals);
 			var me = this;
 			var hasOpt = false, minParams = 0;
 			for( p in params )
 				if( p.opt )
 					hasOpt = true;
-				else if( p.value == null )
+				else
 					minParams++;
 			var f = function(args:Array<Dynamic>) 
 			{			
-				function error(expr)
-				{
-					curExpr = og;
-					if( line != null )
-						curExpr.line = line;
-
-					var me = this;
-					me.error(expr);
-				}
-
-				if( args == null ) error(ENullObjectReference);
- 				var copyArgs:Array<Dynamic> = [];
-				inFunc = true;
-				var i = 0;
-				while( true ) {
-					if( i < args.length ) {
-						var v = args[i];
-						if( v == null ) copyArgs.push(Not_NULL);
-						else copyArgs.push(v);
-						i++;
-						if( i >= args.length ) break;
- 					}
-					else break;
-				}
-				if( copyArgs.length > params.length ) 
-					error(ECustom("Too many arguments"));
-					
-				for( i in 0...params.length ) {
-					var param = params[i];
-					
-					var arg:Dynamic = copyArgs[i];
-					if( param == null ) continue;
-					if( param.opt ) {
-						if( ( arg == Not_NULL || arg == null ) && param.value != null )
-							args[i] = expr(param.value);
-						else if( arg == null && param.value == null )
-							args[i] = null; 
+				if( ( (args == null) ? 0 : args.length ) != params.length ) {
+					if( args.length < minParams ) {
+						var str = "Invalid number of parameters. Got " + args.length + ", required " + minParams;
+						if( name != null ) str += " for function '" + name+"'";
+						error(ECustom(str));
 					}
-					else {
-						if( arg == null && param.value == null ) {
-							var str = "Not enough arguments, expected ";
-							str += param.name;
-							error(ECustom(str));
-						}
-						else if( arg == null && param.value != null )
-							args[i] = expr(param.value);
-					}
+					// make sure mandatory args are forced
+					var args2 = [];
+					var extraParams = args.length - minParams;
+					var pos = 0;
+					for( p in params )
+						if( p.opt ) {
+							if( extraParams > 0 ) {
+								args2.push(args[pos++]);
+								extraParams--;
+							} else
+								args2.push(null);
+						} else
+							args2.push(args[pos++]);
+					args = args2;
 				}
-			
 				var old = me.locals, depth = me.depth;
 				me.depth++;
 				me.locals = me.duplicate(capturedLocals);
 				for( i in 0...params.length )
-				{
-					currentArg = params[i].name;
-					me.locals.set(params[i].name,{ r : {args[i];}});
-				}
+					me.locals.set(params[i].name,{ r : args[i] });
 				var r = null;
 				var oldDecl = declared.length;
 				if( inTry )
@@ -1093,34 +726,13 @@ class Interp {
 				restore(oldDecl);
 				me.locals = old;
 				me.depth = depth;
-				inFunc = false;
-				if( returnedNothing )
-				{
-					if( strictVar )
-						error(ECustom('Void should be Dynamic'));
-				}
-				else 
-					returnedNothing = true;
 				return r;
 			};
-			var oldf = f;
 			var f = Reflect.makeVarArgs(f);
 			if( name != null ) {
 				if( depth == 0 ) {
 					// global function
-					finalVariables.set(name,f);
-					if( inStatic )
-					{
-						if( script.classPath != null && script.classPath.length > 0 && STATICPACKAGES.exists(script.classPath) )
-							STATICPACKAGES.get(script.classPath).tea.fields.set(name,TeaClass.createSugar(inPublic && !noPrivateAccess , f , false , false , true));
-						else if( inPublic ) 
-						{
-							if( !pushedVars.contains(name) ) {
-								pushedVars.push(name);
-								SScript.globalVariables.set(name,f);
-							}
-						}
-					}
+					variables.set(name, f);
 				} else {
 					// function-in-function is a local function
 					declared.push( { n : name, old : locals.get(name) } );
@@ -1129,16 +741,22 @@ class Interp {
 					capturedLocals.set(name, ref); // allow self-recursion
 				}
 			}
+			if(d!=null&&d.v)
+			{
+				dynamicFuncs.set(name,true);
+				if(locals.exists(name))
+					locals[name].dynamicFunc=true;
+			}
 			return f;
 		case EArrayDecl(arr):
-			if( arr.length > 0 && Tools.expr(arr[0]).match(EBinop("=>", _)) ) {
+			if (arr.length > 0 && Tools.expr(arr[0]).match(EBinop("=>", _))) {
 				var isAllString:Bool = true;
 				var isAllInt:Bool = true;
 				var isAllObject:Bool = true;
 				var isAllEnum:Bool = true;
 				var keys:Array<Dynamic> = [];
 				var values:Array<Dynamic> = [];
-				for( e in arr ) {
+				for (e in arr) {
 					switch(Tools.expr(e)) {
 						case EBinop("=>", eKey, eValue): {
 							var key:Dynamic = expr(eKey);
@@ -1154,20 +772,20 @@ class Interp {
 					}
 				}
 				var map:Dynamic = {
-					if(isAllInt) new haxe.ds.IntMap<Dynamic>();
-					else if(isAllString) new haxe.ds.StringMap<Dynamic>();
-					else if(isAllEnum) new haxe.ds.EnumValueMap<Dynamic, Dynamic>();
-					else if(isAllObject) new haxe.ds.ObjectMap<Dynamic, Dynamic>();
+					if (isAllInt) new haxe.ds.IntMap<Dynamic>();
+					else if (isAllString) new haxe.ds.StringMap<Dynamic>();
+					else if (isAllEnum) new haxe.ds.EnumValueMap<Dynamic, Dynamic>();
+					else if (isAllObject) new haxe.ds.ObjectMap<Dynamic, Dynamic>();
 					else new Map<Dynamic, Dynamic>();
 				}
-				for( n in 0...keys.length ) {
+				for (n in 0...keys.length) {
 					setMapValue(map, keys[n], values[n]);
 				}
 				return map;
 			}
 			else {
 				var a = new Array();
-				for( e in arr ) {
+				for ( e in arr ) {
 					a.push(expr(e));
 				}
 				return a;
@@ -1175,7 +793,7 @@ class Interp {
 		case EArray(e, index):
 			var arr:Dynamic = expr(e);
 			var index:Dynamic = expr(index);
-			if(isMap(arr)) {
+			if (isMap(arr)) {
 				return getMapValue(arr, index);
 			}
 			else {
@@ -1185,7 +803,6 @@ class Interp {
 			var a = new Array();
 			for( e in params )
 				a.push(expr(e));
-
 			return cnew(cl,a);
 		case EThrow(e):
 			throw expr(e);
@@ -1218,7 +835,7 @@ class Interp {
 				set(o,f.name,expr(f.e));
 			return o;
 		case ECoalesce(e1,e2,assign):
-			return if( assign ) coalesce2(e1,e2) else coalesce(e1,e2);
+			return if (assign) coalesce2(e1,e2) else coalesce(e1,e2);
 		case ESafeNavigator(e1, f):
 			var e = expr(e1);
 			if( e == null )
@@ -1233,7 +850,7 @@ class Interp {
 			for( c in cases ) {
 				for( v in c.values )
 				{
-					if( ( !Type.enumEq(Tools.expr(v),EIdent("_")) && expr(v) == val ) && ( c.ifExpr == null || expr(c.ifExpr) == true ) ) {
+					if( ( !Type.enumEq(Tools.expr(v),EIdent("_",false)) && expr(v) == val ) && ( c.ifExpr == null || expr(c.ifExpr) == true ) ) {
 						match = true;
 						break;
 					}
@@ -1246,19 +863,9 @@ class Interp {
 			if( !match )
 				val = def == null ? null : expr(def);
 			return val;
-		case EMeta(dot,n,args,e):
-			var emptyExpr = false;
-			if( e == null ) emptyExpr = true;
-			if(n == "privateAccess")
-				hasPrivateAccess = true;
-			else if(n == "noPrivateAccess")
-				noPrivateAccess = false;
-			var e = if( emptyExpr ) null else expr(e);
-			if( n == "privateAccess" )
-				hasPrivateAccess = false;
-			else if( n == "noPrivateAccess" )
-				noPrivateAccess = false;
-			return if( emptyExpr && strictVar ) error(ECustom("Excepted expression")) else e;
+		case EMeta(n, _, e):
+			var e = expr(e);
+			return e;
 		case ECheckType(e,_):
 			return expr(e);
 		}
@@ -1267,11 +874,6 @@ class Interp {
 
 	function doWhileLoop(econd,e) {
 		var old = declared.length;
-		strictVar = true;
-		inBool = true;
-		var ec : Dynamic = expr(econd);
-		checkBool(ec,"do while");
-		inBool = false;
 		do {
 			try {
 				expr(e);
@@ -1282,23 +884,14 @@ class Interp {
 				case SReturn: throw err;
 				}
 			}
-			inBool = true;
-			ec = expr(econd);
-			inBool = false;
 		}
-		while( ec );
-		strictVar = false;
+		while( expr(econd) == true );
 		restore(old);
 	}
 
 	function whileLoop(econd,e) {
 		var old = declared.length;
-		strictVar = true;
-		inBool = true;
-		var ec : Dynamic = expr(econd);
-		checkBool(ec);
-		inBool = false;
-		while( ec ) {
+		while( expr(econd) == true ) {
 			try {
 				expr(e);
 			} catch( err : Stop ) {
@@ -1308,120 +901,26 @@ class Interp {
 				case SReturn: throw err;
 				}
 			}
-			ec = expr(econd);
-			checkBool(ec);
 		}
-		strictVar = false;
 		restore(old);
 	}
 
-	function checkBool(ec : Dynamic , type = "while") : Void
-	{
-		if( ec != null && !Std.isOfType(ec, Bool) ) {
-			var n = Type.getEnumName(ec);
-			if( n == null ) n = Type.getClassName(ec);
-			if( n == null ) {
-				if( Std.isOfType(ec,Int) )
-					n = 'Int';
-				else if( Std.isOfType(ec,Float) )
-					n = 'Float';
-				else if( Std.isOfType(ec,String) )
-					n = 'String';
-				else if( Std.isOfType(ec,Array) )
-					n = 'Array';
-			}
-			if( n != null ) error(ECustom(n + ' should be Bool'));
-			else error(ECustom('Invalid $type expression (should be Bool)'));
-		}
-	}
-
-	function findField(fields : Array<String> , ?mode : String , ?setProp : String , ?val:Dynamic ) : Dynamic 
-	{
-		var f = fields[0];
-		if( f != null && (try resolve(f) catch(e) null) == null )
-		{
-			var fieldCl:Dynamic = null;
-			var cls = [f];
-			for( e in 1...fields.length )
-			{
-				cls.push(fields[e]);
-
-				var cl = cls.join('.');
-				var c = Tools.resolve(cl);
-				if( c != null )
-				{
-					fieldCl = c;
-					break;
-				}
-			}
-
-			
-			if( fieldCl != null )
-			{
-				if( cls.length != fields.length )
-					for( i in cls.length + (setProp == null && mode != 'op' ? 0 : 1)...fields.length ) {
-						var field = fields[i];
-						fieldCl = Reflect.getProperty(fieldCl,field);
-					}
-			}
-
-			if( fieldCl == null )
-				return null;
-
-			if( mode == null )
-				return fieldCl;
-			else if( mode == "set" )
-			{
-				Reflect.setProperty(fieldCl,setProp,val);
-				return val;
-			}
-			else if( mode == 'op' ) 
-				return fieldCl;
-			else	
-				return null;
-		}
-		else 
-			return null;
-	}
-
 	function makeIterator( v : Dynamic ) : Iterator<Dynamic> {
-		if( v is IMap )
-			return new haxe.iterators.MapKeyValueIterator(v);
-
-		#if((flash && !flash9) || (php && !php7 && haxe_ver < '4.0.0'))
-		if( v.iterator != null ) v = v.iterator();
+		#if ((flash && !flash9) || (php && !php7 && haxe_ver < '4.0.0'))
+		if ( v.iterator != null ) v = v.iterator();
 		#else
-		if( v.iterator != null ) try v = v.iterator() catch( e : Dynamic ) {};
+		if ( v.iterator != null ) try v = v.iterator() catch( e : Dynamic ) {};
 		#end
 		if( v.hasNext == null || v.next == null ) error(EInvalidIterator(v));
 		return cast v;
 	}
 
-	function forLoop(n,n2,it,e) {
+	function forLoop(n,it,e) {
 		var old = declared.length;
 		declared.push({ n : n, old : locals.get(n) });
-		if( n2 != null )
-			declared.push({ n : n2, old : locals.get(n2) });
-		strictVar = true;
 		var it = makeIterator(expr(it));
 		while( it.hasNext() ) {
-			var next = it.next();
-			var key = next;
-			if( !Reflect.hasField(next,"key") && !Reflect.hasField(next,"value") && n2 != null )
-			{
-				error(ECustom(Tools.resolveType(next) + " has no field key"));
-			}
-			if( Reflect.hasField(next,"key") )
-			{
-				if( n2 == null )
-					key = Reflect.getProperty(next,"value");
-				else
-					key = Reflect.getProperty(next,"key");
-			}
-
-			locals.set(n,{ r : key });
-			if( Reflect.hasField(next,"value") && n2 != null )
-				locals.set(n2,{ r : Reflect.getProperty(next,"value") });
+			locals.set(n,{ r : it.next() });
 			try {
 				expr(e);
 			} catch( err : Stop ) {
@@ -1432,13 +931,12 @@ class Interp {
 				}
 			}
 		}
-		strictVar = false;
 		restore(old);
 	}
 
 	static inline function isMap(o:Dynamic):Bool {
 		var classes:Array<Dynamic> = ["Map", "StringMap", "IntMap", "ObjectMap", "HashMap", "EnumValueMap", "WeakMap"];
-		if(classes.contains(o))
+		if (classes.contains(o))
 			return true;
 
 		return Std.isOfType(o, IMap);
@@ -1453,58 +951,36 @@ class Interp {
 	}
 
 	function get( o : Dynamic, f : String ) : Dynamic {
-		if( o == null ) error(EInvalidAccess(f));
+		if ( o == null ) error(EInvalidAccess(f));
 		return {
-			for( i => k in STATICPACKAGES )
-				if( k.tea == o ) {
-					var v = k.tea.fields.get(f);
-					if( v == null )
-						error(EDoNotHaveField(k.tea,f));
-					if( !v.isPublic && (v.noAccess || !hasPrivateAccess ) )
-						error(EPrivateField(f));
-					return v.v;
+			var func = StringFunctionTools.getStringToolsFunction(f);
+			if( Std.isOfType(o,String) && usingStringTools && func != null )
+				return func;
+			#if php
+				// https://github.com/HaxeFoundation/haxe/issues/4915
+				try {
+					Reflect.getProperty(o, f);
+				} catch (e:Dynamic) {
+					Reflect.field(o, f);
 				}
-
-			for( i => k in EABSTRACTS ) 
-				if( k.tea == o ) {
-					var v = k.tea.fields[f];
-					if( v == null )
-						error(EAbstractField(k.tea,f));
-					if( !v.isPublic && !hasPrivateAccess )
-						error(EPrivateField(f));
-					return v.v;
-				}
-
-			Reflect.getProperty(o,f);
+			#else
+				return Reflect.getProperty(o,f);
+			#end
 		}
 	}
 
 	function set( o : Dynamic, f : String, v : Dynamic ) : Dynamic {
 		if( o == null ) error(EInvalidAccess(f));
-		for( i => k in STATICPACKAGES )
-			if( k.tea == o ) {
-				var field = k.tea.fields.get(f);
-				if( field == null )
-					error(EDoNotHaveField(k.tea,f));
-				if( !field.isPublic && (field.noAccess || !hasPrivateAccess ) )
-					error(ECustom('Cannot access private field ' + f));
-				if( field.isFinal )
-					error(EInvalidFinal(f));
-				if( field.isFun )
-					error(EFunctionAssign(f));
-				
-				field.v = v;
-				return v;
-			}
-		
-		for( i => k in EABSTRACTS )
-			if( k == o ) error(EWriting);
-
-		Reflect.setProperty(o,f,v);
+		/*if( Type.typeof(v) != TFunction ) Reflect.setField(o,f,v); // NEVER USE setField !!
+		else*/Reflect.setProperty(o,f,v);
 		return v;
 	}
 
 	function fcall( o : Dynamic, f : String, args : Array<Dynamic>) : Dynamic {
+		var func = stringToolsFunction(o,f,args);
+		if( func != null )
+			return func;
+
 		return call(o, get(o, f), args);
 	}
 
@@ -1518,5 +994,26 @@ class Interp {
 		if( c == null ) error(EInvalidAccess(cl));
 
 		return Type.createInstance(c,args);
+	}
+
+	function stringToolsFunction( o : Dynamic , f : String , args : Array<Dynamic> ) : Dynamic {
+		var func = StringFunctionTools.getStringToolsFunction(f);
+		if( Std.isOfType(o,String) && usingStringTools && func != null )
+		{
+			if( args == null || args.length == 0 )
+				return Reflect.callMethod(StringTools,func,[o]);
+			else if( args.length == 1 )
+				return Reflect.callMethod(StringTools,func,[o,args[0]]);
+			else 
+			{
+				var array = [o];
+				for( i in 0...args.length )
+					array.push(Std.string(args[i]));
+
+				return Reflect.callMethod(StringTools,func,array);
+			}
+		} 
+
+		return null;
 	}
 }

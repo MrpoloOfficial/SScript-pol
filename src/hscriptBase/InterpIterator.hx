@@ -1,7 +1,7 @@
-package teaBase;
+package hscriptBase;
 
 @:keepSub
-@:access(teaBase.Interp)
+@:access(hscriptBase.Interp)
 class InterpIterator 
 {
 	public var min:Int;
@@ -29,10 +29,6 @@ class InterpIterator
 
 		this.min = min;
 		this.max = max;
-
-		instance = null;
-		expr1 = null;
-		expr2 = null;
 	}
 
 	public inline function hasNext():Bool
